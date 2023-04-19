@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 
+# TODO ADD THIS:
+# sudo sysctl fs.inotify.max_user_instances=1280
+# sudo sysctl fs.inotify.max_user_watches=655360
+
 KIND_HOME_DIR=${HOME}/.kube/kind
 
 LIMA_VM_NAME=docker-qemu
@@ -28,8 +32,10 @@ function get_variables() {
   # !!! NEED $NAME and $NUMBER to be set !!!
   # TODO: TEST IT :)
 
-  LIMA_IP_ADDR=$(limactl shell ${LIMA_VM_NAME} -- ip -o -4 a s | grep lima0 | grep -E -o 'inet [0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | cut -d' ' -f2)
-  BRIDGE_INT=$(limactl shell ${LIMA_VM_NAME} -- ifconfig | grep -Eo "br-[0-9a-z]*")
+  if [[ $(uname -s) == "Darwin" ]]; then
+    LIMA_IP_ADDR=$(limactl shell ${LIMA_VM_NAME} -- ip -o -4 a s | grep lima0 | grep -E -o 'inet [0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | cut -d' ' -f2)
+    BRIDGE_INT=$(limactl shell ${LIMA_VM_NAME} -- ifconfig | grep -Eo "br-[0-9a-z]*")
+  fi
   IP_KIND=$(docker inspect ${NAME}-control-plane | jq -r '.[0].NetworkSettings.Networks[].IPAddress')
   NETWORK_KIND=$(echo ${IP_KIND} | awk -F. '{ print $1"."$2 }')
   DOCKER_NET="${NETWORK_KIND}.${NUMBER}.0/24"
@@ -77,7 +83,7 @@ function delete_network() {
 function select_k8s_version() {
   # Kind images v0.1.16 (https://github.com/kubernetes-sigs/kind/releases)
   if [[ -z "${K8S_VERSION}" ]]; then
-    K8S_VERSION="1.22"
+    K8S_VERSION="1.23"
   fi
 
   case ${K8S_VERSION} in
@@ -110,15 +116,17 @@ function select_k8s_version() {
 }
 
 function delete-old-docker() {
-  if [ $(docker ps --filter=name=$1 -q|wc -l) -gt 0 ]; then
+  if [ $(docker ps --filter=name=$1 -aq|wc -l) -gt 0 ]; then
     docker rm $1 2>/dev/null
   fi
 }
 
 function is_running() {
   # Return 0 if running, 1 neither
-  docker inspect -f '{{.State.Running}}' "$1" 1>/dev/null 2>&1
-  return $?
+  if [[ $(docker inspect -f '{{.State.Running}}' "$1") == "true" ]]; then
+    return 0
+  fi
+  return 1
 }
 
 # local registry
@@ -274,25 +282,62 @@ function create-kind-cluster() {
   echo ${NUMBER} > $HOME/.kube/kind/${NAME}.number
 
   # KIND CLUSTER
+  cat <<EOF > $HOME/.kube/kind/${NAME}-audit-policy.yaml
+apiVersion: audit.k8s.io/v1
+kind: Policy
+rules:
+- level: Metadata
+EOF
+
+  if [[ $(uname -s) == "Darwin" ]]; then
+    API_SERVER_IP=$(limactl shell ${LIMA_VM_NAME} -- ip -o -4 a s | grep lima0 | grep -E -o 'inet [0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | cut -d' ' -f2)
+  else
+    API_SERVER_IP=0.0.0.0
+  fi
+
   cat << EOF > $HOME/.kube/kind/kind-${NAME}.yaml
-kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
+kind: Cluster
 name: ${NAME}
 featureGates:
   EphemeralContainers: true
 nodes:
 - role: control-plane
   image: ${K8S_IMAGE_URL}
-  extraPortMappings:
-  - containerPort: 6443
-    hostPort: 70${TWODIGITS}
-#- role: worker
-#  image: ${K8S_IMAGE_URL}
+  kubeadmConfigPatches:
+  - |
+    kind: ClusterConfiguration
+    apiServer:
+        extraArgs:
+          audit-log-path: /var/log/kubernetes/kube-apiserver-audit.log
+          audit-policy-file: /etc/kubernetes/policies/${NAME}-audit-policy.yaml
+        extraVolumes:
+          - name: audit-policies
+            hostPath: /etc/kubernetes/policies
+            mountPath: /etc/kubernetes/policies
+            readOnly: true
+            pathType: "DirectoryOrCreate"
+          - name: "audit-logs"
+            hostPath: "/var/log/kubernetes"
+            mountPath: "/var/log/kubernetes"
+            readOnly: false
+            pathType: DirectoryOrCreate
+  extraMounts:
+  - hostPath: $HOME/.kube/kind/${NAME}-audit-policy.yaml
+    containerPath: /etc/kubernetes/policies/${NAME}-audit-policy.yaml
+    readOnly: true
+  # extraPortMappings:
+  # - containerPort: 6443
+  #   hostPort: 70${TWODIGITS}
+# - role: worker
+#   image: ${K8S_IMAGE_URL}
 networking:
+  apiServerAddress: "${API_SERVER_IP}"    # Cross cluster communication
+  apiServerPort: 70${TWODIGITS}           # Cross cluster communication
   serviceSubnet: "10.${NUMBER}.0.0/16"
   podSubnet: "10.1${TWODIGITS}.0.0/16"
-#  disableDefaultCNI: true   # do not install kindnet
-#  kubeProxyMode: none       # do not run kube-proxy
+  # disableDefaultCNI: true               # do not install kindnet
+  # kubeProxyMode: none                   # do not run kube-proxy
 containerdConfigPatches:
 - |-
   [plugins."io.containerd.grpc.v1.cri".registry.mirrors."localhost:${LOCALHOST_CACHE_PORT}"]
@@ -317,7 +362,7 @@ EOF
 
   # kubectl config set-cluster kind-${NAME} --server=https://${myip}:70${TWODIGITS} --insecure-skip-tls-verify=true
   
-  kubectl config set-cluster kind-${NAME} --server=https://${LIMA_IP_ADDR}:70${TWODIGITS} --insecure-skip-tls-verify=true
+  kubectl config set-cluster kind-${NAME} --server=https://${API_SERVER_IP}:70${TWODIGITS} --insecure-skip-tls-verify=true
 
   # NETWORK SETUP FOR DOCKER REGISTRIES
   docker network connect kind ${LOCALHOST_CACHE_NAME} || true
@@ -327,7 +372,7 @@ EOF
 
   # METALLB CONFIGURATION FOR LOAD BALANCERS
   kubectl --context=kind-${NAME} apply -f https://raw.githubusercontent.com/metallb/metallb/v0.13.5/config/manifests/metallb-native.yaml
-  # kubectl --context=kind-${NAME} create secret generic -n metallb-system memberlist --from-literal=secretkey="$(openssl rand -base64 128)"
+  ## kubectl --context=kind-${NAME} create secret generic -n metallb-system memberlist --from-literal=secretkey="$(openssl rand -base64 128)"
 
   cat << EOF > $HOME/.kube/kind/metallb-${NAME}.yaml
 apiVersion: metallb.io/v1beta1
@@ -351,8 +396,8 @@ EOF
   printf "Metallb network is ${DOCKER_NET}\n"
 
   printf "Waiting for metallb to be up before configuring it...\n"
-  sleep 15
-  kubectl -n metallb-system wait pod --all --for condition=Ready --timeout -1s
+  sleep 15 # Time to wait for cluster to spawn and avoid the "can't find metallb"
+  kubectl --context=kind-${NAME} -n metallb-system wait pod --all --for condition=Ready --timeout -1s
   kubectl --context=kind-${NAME} apply -f $HOME/.kube/kind/metallb-${NAME}.yaml
 
   # See https://kind.sigs.k8s.io/docs/user/local-registry/
@@ -401,4 +446,5 @@ function delete-kind-cluster() {
   rm -f $HOME/.kube/kind/kind${NAME}.yaml
   rm -f $HOME/.kube/kind/metallb-${NAME}.yaml
   rm -f $HOME/.kube/kind/${NAME}.number
+  rm -f $HOME/.kube/kind/${NAME}-audit-policy.yaml
 }
