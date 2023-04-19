@@ -61,10 +61,15 @@ data "archive_file" "dotfiles" {
 
 # -------------
 
+resource "random_string" "icv" {
+  length  = 8
+  special = false
+  upper   = false
+}
 resource "aws_s3_bucket" "bucket" {
-  bucket = "kindspotinstance-${var.trigram}-private-ressources"
+  bucket = "${var.trigram}-kindspotinstance-${random_string.icv.result}"
   tags = {
-    Name = "kindspotinstance-${var.trigram}-private-ressources"
+    Name = "${var.trigram}-kindspotinstance-${random_string.icv.result}"
   }
 }
 
@@ -129,7 +134,7 @@ resource "aws_key_pair" "spot_key" {
 }
 
 resource "aws_spot_fleet_request" "spot_instance" {
-  iam_fleet_role       = "arn:aws:iam::253915036081:role/aws-service-role/spotfleet.amazonaws.com/AWSServiceRoleForEC2SpotFleet"
+  iam_fleet_role       = aws_iam_role.fleet_role.arn
   spot_price           = var.spot_bet
   allocation_strategy  = "lowestPrice"
   target_capacity      = 1
@@ -210,6 +215,108 @@ resource "aws_iam_role" "spots" {
   }
 }
 
+resource "aws_iam_policy" "fleet_policy" {
+  name        = "EC2SpotFleetServiceRolePolicy"
+  path        = "/"
+  description = "Allows EC2 Spot Fleet to launch and manage spot fleet instances"
+
+  policy = jsonencode({
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Effect": "Allow",
+        "Action": [
+          "ec2:DescribeImages",
+          "ec2:DescribeSubnets",
+          "ec2:RequestSpotInstances",
+          "ec2:DescribeInstanceStatus",
+          "ec2:RunInstances"
+        ],
+        "Resource": [
+          "*"
+        ]
+      },
+      {
+        "Effect": "Allow",
+        "Action": [
+          "iam:PassRole"
+        ],
+        "Resource": [
+          "*"
+        ],
+        "Condition": {
+          "StringEquals": {
+            "iam:PassedToService": [
+              "ec2.amazonaws.com",
+              "ec2.amazonaws.com.cn"
+            ]
+          }
+        }
+      },
+      {
+        "Effect": "Allow",
+        "Action": [
+          "ec2:CreateTags"
+        ],
+        "Resource": [
+          "arn:aws:ec2:*:*:instance/*",
+          "arn:aws:ec2:*:*:spot-instances-request/*",
+          "arn:aws:ec2:*:*:spot-fleet-request/*",
+          "arn:aws:ec2:*:*:volume/*"
+        ]
+      },
+      {
+        "Effect": "Allow",
+        "Action": [
+          "ec2:TerminateInstances"
+        ],
+        "Resource": "*",
+        "Condition": {
+          "StringLike": {
+            "ec2:ResourceTag/aws:ec2spot:fleet-request-id": "*"
+          }
+        }
+      },
+      {
+        "Effect": "Allow",
+        "Action": [
+          "elasticloadbalancing:RegisterInstancesWithLoadBalancer"
+        ],
+        "Resource": [
+          "arn:aws:elasticloadbalancing:*:*:loadbalancer/*"
+        ]
+      },
+      {
+        "Effect": "Allow",
+        "Action": [
+          "elasticloadbalancing:RegisterTargets"
+        ],
+        "Resource": [
+          "arn:aws:elasticloadbalancing:*:*:*/*"
+        ]
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role" "fleet_role" {
+  name = "ServiceRoleForEC2SpotFleet"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+        {
+            "Effect": "Allow",
+            "Principal": {
+                "Service": "spotfleet.amazonaws.com"
+            },
+            "Action": "sts:AssumeRole"
+        }
+    ]
+  })
+  managed_policy_arns = [aws_iam_policy.fleet_policy.arn]
+}
+
 # -------------
 
 output "spot_public_ip" {
@@ -223,7 +330,7 @@ Shuttle command : screen sshuttle -vvv -e "ssh -v" -r root@${data.aws_instances.
 
 # To connect directly from your laptop
 Kubectl         : scp -R root@${data.aws_instances.spot-fleet-ips.public_ips[0]}:/root/.kube/config /tmp/kube-${data.aws_instances.spot-fleet-ips.public_ips[0]}.config
-                  sed -i 's/localhost/${data.aws_instances.spot-fleet-ips.public_ips[0]}/' /tmp/kube-${data.aws_instances.spot-fleet-ips.public_ips[0]}.config
+                  sed -i 's/0.0.0.0/${data.aws_instances.spot-fleet-ips.public_ips[0]}/' /tmp/kube-${data.aws_instances.spot-fleet-ips.public_ips[0]}.config
               
                   # Then you can use it in multiple ways :
 1.                export KUBECONFIG=/tmp/kube-${data.aws_instances.spot-fleet-ips.public_ips[0]}.config
