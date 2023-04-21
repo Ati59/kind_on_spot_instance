@@ -38,7 +38,7 @@ data "template_file" "bootstrap" {
 
 data "aws_instances" "spot-fleet-ips" {
   depends_on = [
-    aws_spot_fleet_request.spot_instance
+    aws_spot_instance_request.spot_instance
   ]
   instance_tags = {
     Name = "${var.trigram}-kind-spot-instance"
@@ -133,37 +133,49 @@ resource "aws_key_pair" "spot_key" {
   public_key = file(var.ssh_public_key_path)
 }
 
-resource "aws_spot_fleet_request" "spot_instance" {
-  iam_fleet_role       = aws_iam_role.fleet_role.arn
+resource "aws_spot_instance_request" "spot_instance" {
   spot_price           = var.spot_bet
-  allocation_strategy  = "lowestPrice"
-  target_capacity      = 1
+  
+  spot_type            = "persistent"
+  instance_interruption_behavior = "stop"
   wait_for_fulfillment = true
-  terminate_instances_on_delete = true
+  
+  ami                      = data.aws_ami.debian_11.image_id
+  instance_type            = var.instance_type
+  key_name                 = aws_key_pair.spot_key.key_name
+  subnet_id                = var.subnet_id
+  vpc_security_group_ids   = [aws_security_group.ingress_ssh.id]
+  user_data                = data.template_file.bootstrap.rendered
+  monitoring               = false
+  iam_instance_profile     = aws_iam_instance_profile.spots.name
 
-  launch_specification {
-    ami                      = data.aws_ami.debian_11.image_id
-    instance_type            = var.instance_type
-    key_name                 = aws_key_pair.spot_key.key_name
-    subnet_id                = var.subnet_id
-    vpc_security_group_ids   = [aws_security_group.ingress_ssh.id]
-    user_data                = data.template_file.bootstrap.rendered
-    monitoring               = false
-    iam_instance_profile_arn = aws_iam_instance_profile.spots.arn
-
-    root_block_device {
-      volume_size           = 100
-      volume_type           = "gp3"
-      delete_on_termination = "true"
-    }
-
-    tags = merge(
-      { Name = "${var.trigram}-kind-spot-instance" },
-      var.standard_tags
-    )
+  root_block_device {
+    volume_size           = 100
+    volume_type           = "gp3"
+    delete_on_termination = "true"
   }
+
+  tags = merge(
+    { Name = "${var.trigram}-kind-spot-instance" }
+  )
 }
 
+resource "aws_ec2_tag" "defaults" {
+  resource_id = aws_spot_instance_request.spot_instance.spot_instance_id
+  for_each    = var.standard_tags
+  key         = each.key
+  value       = each.value
+}
+resource "aws_ec2_tag" "name" {
+  resource_id = aws_spot_instance_request.spot_instance.spot_instance_id
+  key         = "Name"
+  value       = "${var.trigram}-kind-spot-instance"
+}
+resource "aws_ec2_tag" "autoscaledown" {
+  resource_id = aws_spot_instance_request.spot_instance.spot_instance_id
+  key         = "soloio:autoscaledown:ec2"
+  value       = "true"
+}
 resource "aws_iam_instance_profile" "spots" {
   name = "${var.trigram}_spots"
   role = aws_iam_role.spots.name
@@ -213,108 +225,6 @@ resource "aws_iam_role" "spots" {
       ]
     })
   }
-}
-
-resource "aws_iam_policy" "fleet_policy" {
-  name        = "EC2SpotFleetServiceRolePolicy"
-  path        = "/"
-  description = "Allows EC2 Spot Fleet to launch and manage spot fleet instances"
-
-  policy = jsonencode({
-    "Version": "2012-10-17",
-    "Statement": [
-      {
-        "Effect": "Allow",
-        "Action": [
-          "ec2:DescribeImages",
-          "ec2:DescribeSubnets",
-          "ec2:RequestSpotInstances",
-          "ec2:DescribeInstanceStatus",
-          "ec2:RunInstances"
-        ],
-        "Resource": [
-          "*"
-        ]
-      },
-      {
-        "Effect": "Allow",
-        "Action": [
-          "iam:PassRole"
-        ],
-        "Resource": [
-          "*"
-        ],
-        "Condition": {
-          "StringEquals": {
-            "iam:PassedToService": [
-              "ec2.amazonaws.com",
-              "ec2.amazonaws.com.cn"
-            ]
-          }
-        }
-      },
-      {
-        "Effect": "Allow",
-        "Action": [
-          "ec2:CreateTags"
-        ],
-        "Resource": [
-          "arn:aws:ec2:*:*:instance/*",
-          "arn:aws:ec2:*:*:spot-instances-request/*",
-          "arn:aws:ec2:*:*:spot-fleet-request/*",
-          "arn:aws:ec2:*:*:volume/*"
-        ]
-      },
-      {
-        "Effect": "Allow",
-        "Action": [
-          "ec2:TerminateInstances"
-        ],
-        "Resource": "*",
-        "Condition": {
-          "StringLike": {
-            "ec2:ResourceTag/aws:ec2spot:fleet-request-id": "*"
-          }
-        }
-      },
-      {
-        "Effect": "Allow",
-        "Action": [
-          "elasticloadbalancing:RegisterInstancesWithLoadBalancer"
-        ],
-        "Resource": [
-          "arn:aws:elasticloadbalancing:*:*:loadbalancer/*"
-        ]
-      },
-      {
-        "Effect": "Allow",
-        "Action": [
-          "elasticloadbalancing:RegisterTargets"
-        ],
-        "Resource": [
-          "arn:aws:elasticloadbalancing:*:*:*/*"
-        ]
-      }
-    ]
-  })
-}
-
-resource "aws_iam_role" "fleet_role" {
-  name = "ServiceRoleForEC2SpotFleet"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-        {
-            "Effect": "Allow",
-            "Principal": {
-                "Service": "spotfleet.amazonaws.com"
-            },
-            "Action": "sts:AssumeRole"
-        }
-    ]
-  })
-  managed_policy_arns = [aws_iam_policy.fleet_policy.arn]
 }
 
 # -------------
