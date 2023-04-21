@@ -133,6 +133,10 @@ resource "aws_key_pair" "spot_key" {
   public_key = file(var.ssh_public_key_path)
 }
 
+resource "aws_eip" "ec2" {
+  instance = aws_spot_instance_request.spot_instance.spot_instance_id
+  vpc      = true
+}
 resource "aws_spot_instance_request" "spot_instance" {
   spot_price           = var.spot_bet
   
@@ -140,14 +144,14 @@ resource "aws_spot_instance_request" "spot_instance" {
   instance_interruption_behavior = "stop"
   wait_for_fulfillment = true
   
-  ami                      = data.aws_ami.debian_11.image_id
-  instance_type            = var.instance_type
-  key_name                 = aws_key_pair.spot_key.key_name
-  subnet_id                = var.subnet_id
-  vpc_security_group_ids   = [aws_security_group.ingress_ssh.id]
-  user_data                = data.template_file.bootstrap.rendered
-  monitoring               = false
-  iam_instance_profile     = aws_iam_instance_profile.spots.name
+  ami                         = data.aws_ami.debian_11.image_id
+  instance_type               = var.instance_type
+  key_name                    = aws_key_pair.spot_key.key_name
+  subnet_id                   = var.subnet_id
+  vpc_security_group_ids      = [aws_security_group.ingress_ssh.id]
+  user_data                   = data.template_file.bootstrap.rendered
+  monitoring                  = false
+  iam_instance_profile        = aws_iam_instance_profile.spots.name
 
   root_block_device {
     volume_size           = 100

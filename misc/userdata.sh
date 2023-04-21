@@ -61,3 +61,5 @@ printf "source /usr/local/bin/kind_lib.sh\n" >> /root/.bashrc
 # Create kind cluster
 create-kind-cluster 16 mgmt
 mv /.kube /root
+# This is for VM restart
+ln -s /root/.kube /.kube 
